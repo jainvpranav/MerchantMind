@@ -1,4 +1,6 @@
 import { Badge } from '@/components/ui/badge'
+import Link from 'next/link'
+import { MonitorSmartphone } from 'lucide-react'
 
 export function TopBar() {
   return (
@@ -10,6 +12,15 @@ export function TopBar() {
           Live
         </Badge>
       </div>
+
+      <Link 
+        href="/terminal" 
+        target="_blank"
+        className="flex items-center gap-2 text-sm font-medium text-zinc-300 hover:text-white bg-zinc-800 hover:bg-zinc-700 px-3 py-1.5 rounded-lg transition-colors border border-zinc-700"
+      >
+        <MonitorSmartphone className="size-4 text-red-400" />
+        Launch POS Terminal
+      </Link>
     </header>
   )
 }

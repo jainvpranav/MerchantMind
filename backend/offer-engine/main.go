@@ -41,9 +41,9 @@ func loadConfig() Config {
 		DBPassword:       getEnv("DB_PASSWORD", "localdev123"),
 		DBName:           getEnv("DB_NAME", "merchantmind"),
 		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
-		OfferAgentURL:    getEnv("OFFER_AGENT_URL", "http://localhost:5001/offer"),
+		OfferAgentURL:    getEnv("OFFER_AGENT_URL", "http://localhost:8081/offer"),
 		OfferCacheTTL:    30 * time.Minute, // cache each customer's offer for 30 min
-		Port:             getEnv("PORT", "8082"),
+		Port:             getEnv("PORT", "8081"),
 		AgentTimeoutSecs: 3, // hard 3-second timeout — we'd rather show no offer than slow down payment
 	}
 }

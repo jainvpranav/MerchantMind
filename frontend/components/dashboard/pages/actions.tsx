@@ -8,7 +8,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { endpoints, fetcher, formatTimeAgo, getAgentTypeStyle, approveCampaign, rejectCampaign } from '@/lib/api'
+import { endpoints, fetcher, formatTimeAgo, getAgentTypeStyle, approveCampaign, rejectCampaign, runRecoveryAgent } from '@/lib/api'
 import type { CampaignsResponse, Campaign } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
@@ -204,8 +204,14 @@ export function ActionsPage() {
     }
   }
 
-  const handleRunRecoveryAgent = () => {
-    toast.info('Recovery Agent triggered — wiring coming soon!')
+  const handleRunRecoveryAgent = async () => {
+    try {
+      await runRecoveryAgent()
+      toast.success('Recovery Agent started in the background.')
+      setTimeout(() => mutate(), 5000) // refresh campaigns after 5s
+    } catch (e) {
+      toast.error('Failed to start Recovery Agent')
+    }
   }
 
   const campaigns = data?.campaigns || []

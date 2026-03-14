@@ -1,37 +1,51 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	_ "github.com/lib/pq"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 type Config struct {
-	DBHost     string
-	DBPort     string
-	DBUser     string
-	DBPassword string
-	DBName     string
-	Port       string
+	DBHost           string
+	DBPort           string
+	DBUser           string
+	DBPassword       string
+	DBName           string
+	Port             string
+	RedisAddr        string
+	OfferAgentURL    string
+	OfferCacheTTL    time.Duration
+	AgentTimeoutSecs int
 }
 
 func loadConfig() Config {
 	return Config{
-		DBHost:     getEnv("DB_HOST", "localhost"),
-		DBPort:     getEnv("DB_PORT", "5432"),
-		DBUser:     getEnv("DB_USER", "merchantmind"),
-		DBPassword: getEnv("DB_PASSWORD", "localdev123"),
-		DBName:     getEnv("DB_NAME", "merchantmind"),
-		Port:       getEnv("PORT", "8081"),
+		DBHost:           getEnv("DB_HOST", "localhost"),
+		DBPort:           getEnv("DB_PORT", "5432"),
+		DBUser:           getEnv("DB_USER", "merchantmind"),
+		DBPassword:       getEnv("DB_PASSWORD", "localdev123"),
+		DBName:           getEnv("DB_NAME", "merchantmind"),
+		Port:             getEnv("PORT", "8081"),
+		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
+		OfferAgentURL:    getEnv("OFFER_AGENT_URL", "http://localhost:5001/offer"),
+		OfferCacheTTL:    30 * time.Minute,
+		AgentTimeoutSecs: 8,
 	}
 }
 
@@ -119,6 +133,139 @@ type ApproveRequest struct {
 	ScheduledAt *time.Time `json:"scheduled_at"` // optional — defaults to now
 }
 
+// ── Offer Models ──────────────────────────────────────────────────────────────
+
+type OfferRequest struct {
+	MerchantID   string `json:"merchant_id"   binding:"required"`
+	CustomerHash string `json:"customer_hash" binding:"required"`
+}
+
+type OfferResponse struct {
+	HasOffer       bool    `json:"has_offer"`
+	DisplayText    string  `json:"display_text,omitempty"`
+	Category       string  `json:"offer_category,omitempty"`
+	DiscountAmount float64 `json:"discount_amount,omitempty"`
+	Source         string  `json:"source"`
+	ElapsedMS      int64   `json:"elapsed_ms"`
+}
+
+type TagRequest struct {
+	MerchantID   string  `json:"merchant_id" binding:"required"`
+	Category     string  `json:"category" binding:"required"`
+	Amount       float64 `json:"amount" binding:"required"`
+	CustomerHash string  `json:"customer_hash"`
+}
+
+type agentPayload struct {
+	CustomerHash string `json:"customer_hash"`
+}
+
+type agentResponse struct {
+	HasOffer       bool    `json:"has_offer"`
+	DisplayText    string  `json:"display_text"`
+	OfferCategory  string  `json:"offer_category"`
+	DiscountAmount float64 `json:"discount_amount"`
+	Reasoning      string  `json:"reasoning"`
+	ElapsedSecs    float64 `json:"elapsed_seconds"`
+}
+
+// ── Redis Cache ───────────────────────────────────────────────────────────────
+
+func connectRedis(cfg Config) *redis.Client {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: "",
+		DB:       0,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Printf("⚠️  Redis unavailable (%v) — offer caching disabled", err)
+		return nil
+	}
+	log.Println("✅ Connected to Redis")
+	return rdb
+}
+
+func cacheKey(merchantID, customerHash string) string {
+	return fmt.Sprintf("offer:%s:%s", merchantID, customerHash)
+}
+
+func getFromCache(rdb *redis.Client, merchantID, customerHash string) (*OfferResponse, bool) {
+	if rdb == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	val, err := rdb.Get(ctx, cacheKey(merchantID, customerHash)).Result()
+	if err != nil {
+		return nil, false
+	}
+
+	var offer OfferResponse
+	if err := json.Unmarshal([]byte(val), &offer); err != nil {
+		return nil, false
+	}
+	offer.Source = "cache"
+	return &offer, true
+}
+
+func setInCache(rdb *redis.Client, merchantID, customerHash string, offer OfferResponse, ttl time.Duration) {
+	if rdb == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	data, err := json.Marshal(offer)
+	if err != nil {
+		return
+	}
+	_ = rdb.Set(ctx, cacheKey(merchantID, customerHash), data, ttl).Err()
+}
+
+// ── Python Agent Caller ───────────────────────────────────────────────────────
+
+func callOfferAgent(cfg Config, customerHash string) (*agentResponse, error) {
+	payload, err := json.Marshal(agentPayload{CustomerHash: customerHash})
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Duration(cfg.AgentTimeoutSecs)*time.Second,
+	)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.OfferAgentURL,
+		bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("agent request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading agent response: %w", err)
+	}
+
+	var ar agentResponse
+	if err := json.Unmarshal(body, &ar); err != nil {
+		return nil, fmt.Errorf("parsing agent response: %w", err)
+	}
+
+	return &ar, nil
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // GET /v1/merchant/:id/summary
@@ -180,6 +327,61 @@ func handleSummary(db *sql.DB) gin.HandlerFunc {
 		_ = row.Scan(&s.ActiveCampaigns)
 
 		c.JSON(http.StatusOK, s)
+	}
+}
+
+// runPythonAgent launches a Python bedrock agent script in a background goroutine.
+// scriptName should be the filename only (e.g. "recovery_agent_bedrock.py").
+// agentsDir is the absolute path to ml/agents/.
+func runPythonAgent(agentsDir, scriptName, merchantID string) {
+	scriptPath := agentsDir + "/" + scriptName
+	cmd := exec.Command("python", scriptPath)
+	// Set working dir to ml/agents so python's load_dotenv finds the right .env
+	cmd.Dir = agentsDir
+	cmd.Env = append(os.Environ(), "MERCHANT_ID="+merchantID, "PYTHONIOENCODING=utf-8")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("❌ %s failed: %v\nOutput: %s", scriptName, err, string(out))
+	} else {
+		log.Printf("✅ %s finished successfully\n%s", scriptName, string(out))
+	}
+}
+
+// agentsDir returns the absolute path to ml/agents relative to this binary.
+// Assumes the binary is run from the backend/merchant-api folder.
+func agentsDirPath() string {
+	// Walk up two levels from backend/merchant-api to the project root, then into ml/agents
+	wd, err := os.Getwd()
+	if err != nil {
+		return "../../ml/agents"
+	}
+	return wd + "/../../ml/agents"
+}
+
+// POST /v1/merchant/:id/agent/recovery
+// Manually triggers the Python Recovery Agent (Bedrock version)
+func handleRunRecoveryAgent(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		go func(mID string) {
+			log.Printf("🔄 Starting recovery agent for merchant %s", mID)
+			runPythonAgent(agentsDirPath(), "recovery_agent_bedrock.py", mID)
+		}(merchantID)
+		c.JSON(http.StatusAccepted, gin.H{"status": "accepted", "message": "Recovery agent started"})
+	}
+}
+
+// POST /v1/merchant/:id/agent/restock
+// Manually triggers the Python Restock Agent (Bedrock version)
+func handleRunRestockAgent(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		go func(mID string) {
+			log.Printf("🔄 Starting restock agent for merchant %s", mID)
+			runPythonAgent(agentsDirPath(), "restock_agent_bedrock.py", mID)
+		}(merchantID)
+		c.JSON(http.StatusAccepted, gin.H{"status": "accepted", "message": "Restock agent started"})
 	}
 }
 
@@ -401,6 +603,30 @@ func handleApproveCampaign(db *sql.DB) gin.HandlerFunc {
 		}
 
 		log.Printf("✅ Campaign approved: id=%s scheduled=%s", campaignID, scheduledAt.Format(time.RFC3339))
+
+		// Dispatched to WhatsApp Agent for POC
+		// go func(id string) {
+		// 	var msgBody string
+		// 	err := db.QueryRow("SELECT message_body FROM campaigns WHERE id = $1", id).Scan(&msgBody)
+		// 	if err != nil {
+		// 		log.Printf("⚠️ Could not fetch campaign body for WhatsApp: %v", err)
+		// 		return
+		// 	}
+
+		// 	payload := map[string]string{
+		// 		"to":      "918618994561", // User requested PoC number
+		// 		"message": msgBody,
+		// 	}
+		// 	jsonPayload, _ := json.Marshal(payload)
+		// 	resp, err := http.Post("http://localhost:5002/send", "application/json", bytes.NewBuffer(jsonPayload))
+		// 	if err != nil {
+		// 		log.Printf("⚠️ WhatsApp Agent unreachable: %v", err)
+		// 		return
+		// 	}
+		// 	defer resp.Body.Close()
+		// 	log.Printf("📱 WhatsApp Agent response: %d", resp.StatusCode)
+		// }(campaignID)
+
 		c.JSON(http.StatusOK, gin.H{
 			"status":       "approved",
 			"campaign_id":  campaignID,
@@ -480,14 +706,90 @@ func handleVelocity(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// GET /health
-func handleHealth(db *sql.DB) gin.HandlerFunc {
+// POST /v1/offer/realtime
+func handleRealtimeOffer(db *sql.DB, rdb *redis.Client, cfg Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if err := db.Ping(); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_down", "error": err.Error()})
+		start := time.Now()
+
+		var req OfferRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "merchant-api"})
+
+		if cached, ok := getFromCache(rdb, req.MerchantID, req.CustomerHash); ok {
+			cached.ElapsedMS = time.Since(start).Milliseconds()
+			log.Printf("⚡ Cache hit: merchant=%s customer=%s offer=%v", req.MerchantID, req.CustomerHash, cached.HasOffer)
+			c.JSON(http.StatusOK, cached)
+			return
+		}
+
+		agentResp, err := callOfferAgent(cfg, req.CustomerHash)
+		if err != nil {
+			log.Printf("⚠️  Offer agent failed (merchant=%s customer=%s): %v", req.MerchantID, req.CustomerHash, err)
+			c.JSON(http.StatusOK, OfferResponse{HasOffer: false, Source: "fallback", ElapsedMS: time.Since(start).Milliseconds()})
+			return
+		}
+
+		offer := OfferResponse{
+			HasOffer:       agentResp.HasOffer,
+			DisplayText:    agentResp.DisplayText,
+			Category:       agentResp.OfferCategory,
+			DiscountAmount: agentResp.DiscountAmount,
+			Source:         "agent",
+			ElapsedMS:      time.Since(start).Milliseconds(),
+		}
+
+		setInCache(rdb, req.MerchantID, req.CustomerHash, offer, cfg.OfferCacheTTL)
+		log.Printf("🎯 Offer served: merchant=%s customer=%s has_offer=%v elapsed=%dms", req.MerchantID, req.CustomerHash, offer.HasOffer, offer.ElapsedMS)
+		c.JSON(http.StatusOK, offer)
+	}
+}
+
+// POST /v1/offer/invalidate
+func handleInvalidateOffer(rdb *redis.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req OfferRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			_ = rdb.Del(ctx, cacheKey(req.MerchantID, req.CustomerHash)).Err()
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "invalidated"})
+	}
+}
+
+// POST /v1/transaction/tag
+func handleTagTransaction(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req TagRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		_, err := db.Exec(`
+			INSERT INTO transactions (merchant_id, amount, category, customer_hash, transacted_at)
+			VALUES ($1, $2, $3, $4, NOW())
+		`, req.MerchantID, req.Amount, req.Category, req.CustomerHash)
+
+		if err != nil {
+			log.Printf("❌ Failed inserting transaction tag: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		// Trigger background Restock and Recovery Agents
+		go runPythonAgent(agentsDirPath(), "restock_agent_bedrock.py", req.MerchantID)
+		if req.CustomerHash != "" {
+			go runPythonAgent(agentsDirPath(), "recovery_agent_bedrock.py", req.MerchantID)
+		}
+
+		c.JSON(http.StatusOK, gin.H{"status": "tagged and agents triggered"})
 	}
 }
 
@@ -502,11 +804,15 @@ func main() {
 	}
 	defer db.Close()
 
+	rdb := connectRedis(cfg)
+	if rdb != nil {
+		defer rdb.Close()
+	}
+
 	r := gin.Default()
 
-	// CORS — allow the React dashboard to call this API
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "https://*.vercel.app"},
+		AllowOrigins:     []string{"http://localhost:3000", "https://*.vercel.app", "http://localhost:*"},
 		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -514,12 +820,38 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	// Health
-	r.GET("/health", handleHealth(db))
+	r.GET("/health", func(c *gin.Context) {
+		dbOK := db.Ping() == nil
+		redisOK := false
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			redisOK = rdb.Ping(ctx).Err() == nil
+		}
 
-	// Merchant data endpoints
+		status := "ok"
+		code := http.StatusOK
+		if !dbOK {
+			status = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+
+		c.JSON(code, gin.H{"status": status, "service": "merchant-api", "db": dbOK, "redis": redisOK})
+	})
+
 	v1 := r.Group("/v1")
 	{
+		offer := v1.Group("/offer")
+		{
+			offer.POST("/realtime",   handleRealtimeOffer(db, rdb, cfg))
+			offer.POST("/invalidate", handleInvalidateOffer(rdb))
+		}
+
+		transaction := v1.Group("/transaction")
+		{
+			transaction.POST("/tag", handleTagTransaction(db))
+		}
+
 		merchant := v1.Group("/merchant/:id")
 		{
 			merchant.GET("/summary",   handleSummary(db))
@@ -528,6 +860,8 @@ func main() {
 			merchant.GET("/customers", handleCustomers(db))
 			merchant.GET("/campaigns", handleCampaigns(db))
 			merchant.GET("/velocity",  handleVelocity(db))
+			merchant.POST("/agent/recovery", handleRunRecoveryAgent(db))
+			merchant.POST("/agent/restock",  handleRunRestockAgent(db))
 		}
 
 		campaign := v1.Group("/campaign")
@@ -547,6 +881,8 @@ func main() {
 	log.Printf("   GET  /v1/merchant/:id/velocity")
 	log.Printf("   POST /v1/campaign/:id/approve")
 	log.Printf("   POST /v1/campaign/:id/reject")
+	log.Printf("   POST /v1/merchant/:id/agent/recovery")
+	log.Printf("   POST /v1/merchant/:id/agent/restock")
 
 	if err := r.Run(":" + cfg.Port); err != nil {
 		log.Fatalf("server error: %v", err)

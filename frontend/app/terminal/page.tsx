@@ -66,6 +66,26 @@ function StatusBar() {
   )
 }
 
+// ── Card Brands ──────────────────────────────────────────────────────────────
+function CardLogos({ compact = false }: { compact?: boolean }) {
+  const brands = [
+    { name: 'Visa', color: 'bg-[#1A1F71] text-white' },
+    { name: 'Mastercard', color: 'bg-[#EB001B] text-white' },
+    { name: 'RuPay', color: 'bg-[#FF9933] text-white' },
+    { name: 'Amex', color: 'bg-[#007BC1] text-white' },
+  ]
+  
+  return (
+    <div className={`flex flex-wrap items-center justify-center gap-2 ${compact ? 'mt-2 opacity-50 grayscale' : 'mt-6 opacity-80'}`}>
+      {brands.map(b => (
+        <div key={b.name} className={`${compact ? 'px-1.5 py-0.5 text-[8px]' : 'px-3 py-1 text-xs'} rounded font-black italic tracking-tighter ${b.color}`}>
+          {b.name.toUpperCase()}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export default function TerminalSimulator() {
   const [state, setState]               = useState<TerminalState>('idle')
   const [amount, setAmount]             = useState('1500')
@@ -237,8 +257,8 @@ export default function TerminalSimulator() {
 
           {/* PROCESSING */}
           {state === 'processing' && (
-            <div className="flex-1 flex flex-col items-center justify-center gap-5 p-8 animate-in zoom-in-95 duration-300">
-              <div className="relative size-20">
+            <div className="flex-1 flex flex-col items-center justify-center p-8 animate-in zoom-in-95 duration-300">
+              <div className="relative size-20 mb-6">
                 <div className="absolute inset-0 border-4 border-gray-100 rounded-full" />
                 <div className="absolute inset-0 border-4 border-red-500 rounded-full border-t-transparent animate-spin" />
                 <CreditCard className="absolute inset-0 m-auto size-7 text-gray-400" />
@@ -247,6 +267,8 @@ export default function TerminalSimulator() {
                 <p className="font-semibold text-gray-800">Checking Offers…</p>
                 <p className="text-xs text-gray-400 mt-1">Contacting MerchantMind AI</p>
               </div>
+              
+              <CardLogos />
             </div>
           )}
 
@@ -286,6 +308,8 @@ export default function TerminalSimulator() {
                   No thanks, pay full amount
                 </button>
               </div>
+              
+              <CardLogos compact />
             </div>
           )}
 

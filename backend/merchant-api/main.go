@@ -322,7 +322,7 @@ func handleSummary(db *sql.DB) gin.HandlerFunc {
 			SELECT COUNT(*)
 			FROM campaigns
 			WHERE merchant_id = $1
-			  AND status IN ('draft', 'approved')
+			  AND status IN ('draft', 'draft')
 		`, merchantID)
 		_ = row.Scan(&s.ActiveCampaigns)
 

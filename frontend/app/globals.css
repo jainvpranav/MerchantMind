@@ -1,9 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Mono:wght@400;500&display=swap');
 @import 'tailwindcss';
 @import 'tw-animate-css';
 
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  /* ── Paytm Design System ── */
+  --ptm-blue: #00BAF2;
+  --ptm-blue-dim: #0097C4;
+  --ptm-navy: #002970;
+  --ptm-navy2: #003DA5;
+  --ptm-bg: #EEF2FA;
+  --ptm-surface: #FFFFFF;
+  --ptm-surface2: #F5F7FD;
+  --ptm-border: #DDE4F2;
+  --ptm-text: #0D1B3E;
+  --ptm-muted: #7A8AAE;
+  --ptm-green: #00C48C;
+  --ptm-amber: #F5A623;
+  --ptm-red: #E84040;
+
+  /* ── Shadcn tokens (kept for UI lib components) ── */
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -39,44 +56,9 @@
   --sidebar-ring: oklch(0.708 0 0);
 }
 
-.dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.145 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.145 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.985 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.396 0.141 25.723);
-  --destructive-foreground: oklch(0.637 0.237 25.331);
-  --border: oklch(0.269 0 0);
-  --input: oklch(0.269 0 0);
-  --ring: oklch(0.439 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(0.269 0 0);
-  --sidebar-ring: oklch(0.439 0 0);
-}
-
 @theme inline {
-  --font-sans: var(--font-inter), 'Inter', 'Geist', sans-serif;
-  --font-mono: 'Geist Mono', 'Geist Mono Fallback';
+  --font-sans: 'DM Sans', var(--font-inter), 'Inter', sans-serif;
+  --font-mono: 'DM Mono', 'Geist Mono', monospace;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -121,21 +103,30 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-family: 'DM Sans', sans-serif;
   }
 }
 
-/* Confetti Animation */
+/* ── Paytm Animations ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.anim       { animation: fadeUp 0.35s ease forwards; }
+.anim-d1    { animation-delay: 0.05s; opacity: 0; }
+.anim-d2    { animation-delay: 0.10s; opacity: 0; }
+.anim-d3    { animation-delay: 0.15s; opacity: 0; }
+.anim-d4    { animation-delay: 0.20s; opacity: 0; }
+.anim-d5    { animation-delay: 0.25s; opacity: 0; }
+.pulse-dot  { animation: pulse-dot 2s infinite; }
+
+/* Confetti */
 @keyframes confetti {
-  0% {
-    transform: translateY(0) rotate(0deg);
-    opacity: 1;
-  }
-  100% {
-    transform: translateY(100vh) rotate(720deg);
-    opacity: 0;
-  }
+  0%   { transform: translateY(0) rotate(0deg); opacity: 1; }
+  100% { transform: translateY(100vh) rotate(720deg); opacity: 0; }
 }
-
-.animate-confetti {
-  animation: confetti 2s ease-out forwards;
-}
+.animate-confetti { animation: confetti 2s ease-out forwards; }

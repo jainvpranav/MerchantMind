@@ -8,8 +8,8 @@ import './globals.css'
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
-  title: 'MerchantMind | Pine Labs Analytics',
-  description: 'AI-powered merchant analytics dashboard for Pine Labs',
+  title: 'MunimAI | Paytm Merchant Dashboard',
+  description: 'AI-powered merchant analytics, offers & customer insights — powered by Paytm',
   generator: 'v0.app',
   icons: {
     icon: '/icon.png',

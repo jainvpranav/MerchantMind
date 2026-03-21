@@ -81,13 +81,16 @@ func connectDB(cfg Config) (*sql.DB, error) {
 // ── Response models ───────────────────────────────────────────────────────────
 
 type SummaryResponse struct {
-	MerchantID    string  `json:"merchant_id"`
-	TodayRevenue  float64 `json:"today_revenue"`
-	TodayTxns     int     `json:"today_txns"`
-	WeekRevenue   float64 `json:"week_revenue"`
-	WeekTxns      int     `json:"week_txns"`
-	TopCategory   string  `json:"top_category"`
-	ActiveCampaigns int   `json:"active_campaigns"`
+	MerchantID         string  `json:"merchant_id"`
+	TodayRevenue       float64 `json:"today_revenue"`
+	TodayRevenueChange float64 `json:"today_revenue_change"` // % change vs yesterday
+	TodayTxns          int     `json:"today_txns"`
+	WeekRevenue        float64 `json:"week_revenue"`
+	WeekRevenueChange  float64 `json:"week_revenue_change"` // % change vs last week
+	WeekTxns           int     `json:"week_txns"`
+	TopCategory        string  `json:"top_category"`
+	ActiveCampaigns    int     `json:"active_campaigns"`
+	CampaignsChange    int     `json:"campaigns_change"` // delta since yesterday
 }
 
 type PatternRow struct {
@@ -133,20 +136,41 @@ type ApproveRequest struct {
 	ScheduledAt *time.Time `json:"scheduled_at"` // optional — defaults to now
 }
 
-// ── Offer Models ──────────────────────────────────────────────────────────────
+// ── Offer & Category Models ───────────────────────────────────────────────────
 
+type OfferRow struct {
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Type      string  `json:"type"`       // maps to offer_type
+	Value     float64 `json:"value"`      // maps to discount_value
+	MinAmount float64 `json:"minAmount"`
+	Segment   string  `json:"segment"`    // maps to target_segment
+	Category  string  `json:"category"`   // maps to category_tag
+	Active    bool    `json:"active"`     // maps to is_active
+}
+
+type CategoryRow struct {
+	Name  string `json:"name"`
+	Desc  string `json:"desc"`
+	Emoji string `json:"emoji"`
+}
 type OfferRequest struct {
 	MerchantID   string `json:"merchant_id"   binding:"required"`
 	CustomerHash string `json:"customer_hash" binding:"required"`
 }
 
+type OfferDetails struct {
+	Category       string  `json:"offer_category"`
+	DisplayText    string  `json:"display_text"`
+	DiscountAmount float64 `json:"discount_amount"`
+	Reasoning      string  `json:"reasoning"`
+}
+
 type OfferResponse struct {
-	HasOffer       bool    `json:"has_offer"`
-	DisplayText    string  `json:"display_text,omitempty"`
-	Category       string  `json:"offer_category,omitempty"`
-	DiscountAmount float64 `json:"discount_amount,omitempty"`
-	Source         string  `json:"source"`
-	ElapsedMS      int64   `json:"elapsed_ms"`
+	HasOffer  bool           `json:"has_offer"`
+	Offers    []OfferDetails `json:"offers,omitempty"`
+	Source    string         `json:"source"`
+	ElapsedMS int64          `json:"elapsed_ms"`
 }
 
 type TagRequest struct {
@@ -161,12 +185,9 @@ type agentPayload struct {
 }
 
 type agentResponse struct {
-	HasOffer       bool    `json:"has_offer"`
-	DisplayText    string  `json:"display_text"`
-	OfferCategory  string  `json:"offer_category"`
-	DiscountAmount float64 `json:"discount_amount"`
-	Reasoning      string  `json:"reasoning"`
-	ElapsedSecs    float64 `json:"elapsed_seconds"`
+	HasOffer    bool           `json:"has_offer"`
+	Offers      []OfferDetails `json:"offers"`
+	ElapsedSecs float64        `json:"elapsed_seconds"`
 }
 
 // ── Redis Cache ───────────────────────────────────────────────────────────────
@@ -277,54 +298,77 @@ func handleSummary(db *sql.DB) gin.HandlerFunc {
 		var s SummaryResponse
 		s.MerchantID = merchantID
 
-		// Today revenue + txn count
+		// TODAY
 		row := db.QueryRow(`
-			SELECT
-				COALESCE(SUM(amount), 0),
-				COUNT(*)
-			FROM transactions
-			WHERE merchant_id = $1
-			  AND transacted_at >= CURRENT_DATE
+			SELECT 
+				COALESCE(SUM(amount), 0), 
+				COUNT(*) 
+			FROM transactions 
+			WHERE merchant_id = $1 AND transacted_at >= CURRENT_DATE
 		`, merchantID)
 		if err := row.Scan(&s.TodayRevenue, &s.TodayTxns); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		// This week revenue + txn count
+		// YESTERDAY (for change calc)
+		var yesterdayRev float64
+		_ = db.QueryRow(`
+			SELECT COALESCE(SUM(amount), 0) FROM transactions 
+			WHERE merchant_id = $1 
+			  AND transacted_at >= CURRENT_DATE - INTERVAL '1 day' 
+			  AND transacted_at < CURRENT_DATE
+		`, merchantID).Scan(&yesterdayRev)
+		if yesterdayRev > 0 {
+			s.TodayRevenueChange = ((s.TodayRevenue - yesterdayRev) / yesterdayRev) * 100
+		} else if s.TodayRevenue > 0 {
+			s.TodayRevenueChange = 100
+		}
+
+		// THIS WEEK
 		row = db.QueryRow(`
-			SELECT
-				COALESCE(SUM(amount), 0),
-				COUNT(*)
-			FROM transactions
-			WHERE merchant_id = $1
-			  AND transacted_at >= DATE_TRUNC('week', NOW())
+			SELECT 
+				COALESCE(SUM(amount), 0), 
+				COUNT(*) 
+			FROM transactions 
+			WHERE merchant_id = $1 AND transacted_at >= DATE_TRUNC('week', NOW())
 		`, merchantID)
 		if err := row.Scan(&s.WeekRevenue, &s.WeekTxns); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
-		// Top category this week
-		row = db.QueryRow(`
-			SELECT category
-			FROM transactions
-			WHERE merchant_id = $1
-			  AND transacted_at >= DATE_TRUNC('week', NOW())
-			GROUP BY category
-			ORDER BY COUNT(*) DESC
-			LIMIT 1
-		`, merchantID)
-		_ = row.Scan(&s.TopCategory) // not fatal if no data yet
+		// LAST WEEK
+		var lastWeekRev float64
+		_ = db.QueryRow(`
+			SELECT COALESCE(SUM(amount), 0) FROM transactions 
+			WHERE merchant_id = $1 
+			  AND transacted_at >= DATE_TRUNC('week', NOW()) - INTERVAL '7 days'
+			  AND transacted_at < DATE_TRUNC('week', NOW())
+		`, merchantID).Scan(&lastWeekRev)
+		if lastWeekRev > 0 {
+			s.WeekRevenueChange = ((s.WeekRevenue - lastWeekRev) / lastWeekRev) * 100
+		} else if s.WeekRevenue > 0 {
+			s.WeekRevenueChange = 100
+		}
 
-		// Draft + approved campaigns pending action
+		// TOP CATEGORY
 		row = db.QueryRow(`
-			SELECT COUNT(*)
-			FROM campaigns
-			WHERE merchant_id = $1
-			  AND status IN ('draft', 'draft')
+			SELECT category FROM transactions 
+			WHERE merchant_id = $1 AND transacted_at >= DATE_TRUNC('week', NOW())
+			GROUP BY category ORDER BY COUNT(*) DESC LIMIT 1
 		`, merchantID)
+		_ = row.Scan(&s.TopCategory)
+
+		// CAMPAIGNS (DRAFTS) PENDING
+		row = db.QueryRow(`SELECT COUNT(*) FROM campaigns WHERE merchant_id = $1 AND status = 'draft'`, merchantID)
 		_ = row.Scan(&s.ActiveCampaigns)
+
+		// CAMPAIGN DELTA (Drafts created since yesterday)
+		_ = db.QueryRow(`
+			SELECT COUNT(*) FROM campaigns 
+			WHERE merchant_id = $1 AND status = 'draft' AND created_at >= NOW() - INTERVAL '1 day'
+		`, merchantID).Scan(&s.CampaignsChange)
 
 		c.JSON(http.StatusOK, s)
 	}
@@ -671,13 +715,13 @@ func handleVelocity(db *sql.DB) gin.HandlerFunc {
 
 		rows, err := db.Query(`
 			SELECT
-				category,
+				INITCAP(TRIM(category)),
 				COUNT(*) FILTER (WHERE transacted_at >= NOW() - INTERVAL '7 days')  AS last_7,
 				COUNT(*) FILTER (WHERE transacted_at >= NOW() - INTERVAL '14 days'
 				                   AND transacted_at <  NOW() - INTERVAL '7 days')  AS prev_7
 			FROM transactions
 			WHERE merchant_id = $1
-			GROUP BY category
+			GROUP BY INITCAP(TRIM(category))
 			ORDER BY last_7 DESC
 		`, merchantID)
 		if err != nil {
@@ -732,12 +776,10 @@ func handleRealtimeOffer(db *sql.DB, rdb *redis.Client, cfg Config) gin.HandlerF
 		}
 
 		offer := OfferResponse{
-			HasOffer:       agentResp.HasOffer,
-			DisplayText:    agentResp.DisplayText,
-			Category:       agentResp.OfferCategory,
-			DiscountAmount: agentResp.DiscountAmount,
-			Source:         "agent",
-			ElapsedMS:      time.Since(start).Milliseconds(),
+			HasOffer:  agentResp.HasOffer,
+			Offers:    agentResp.Offers,
+			Source:    "agent",
+			ElapsedMS: time.Since(start).Milliseconds(),
 		}
 
 		setInCache(rdb, req.MerchantID, req.CustomerHash, offer, cfg.OfferCacheTTL)
@@ -793,6 +835,142 @@ func handleTagTransaction(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// ── Categories & Offers Handlers ──────────────────────────────────────────────
+
+// GET /v1/merchant/:id/offers
+func handleGetOffers(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		rows, err := db.Query(`
+			SELECT id, title, offer_type, discount_value, min_amount, target_segment, category_tag, is_active
+			FROM offers WHERE merchant_id = $1 ORDER BY created_at DESC
+		`, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		var offers []OfferRow
+		for rows.Next() {
+			var o OfferRow
+			if err := rows.Scan(&o.ID, &o.Title, &o.Type, &o.Value, &o.MinAmount, &o.Segment, &o.Category, &o.Active); err == nil {
+				offers = append(offers, o)
+			}
+		}
+		if offers == nil { offers = []OfferRow{} }
+		c.JSON(http.StatusOK, offers)
+	}
+}
+
+// POST /v1/merchant/:id/offers
+func handleAddOffer(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		var o OfferRow
+		if err := c.ShouldBindJSON(&o); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		err := db.QueryRow(`
+			INSERT INTO offers (merchant_id, title, offer_type, discount_value, min_amount, target_segment, category_tag, is_active)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
+		`, merchantID, o.Title, o.Type, o.Value, o.MinAmount, o.Segment, o.Category, o.Active).Scan(&o.ID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, o)
+	}
+}
+
+// PUT /v1/merchant/:id/offers/:offer_id/toggle
+func handleToggleOffer(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		offerID := c.Param("offer_id")
+		_, err := db.Exec(`UPDATE offers SET is_active = NOT is_active WHERE id = $1 AND merchant_id = $2`, offerID, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "toggled"})
+	}
+}
+
+// DELETE /v1/merchant/:id/offers/:offer_id
+func handleDeleteOffer(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		offerID := c.Param("offer_id")
+		_, err := db.Exec(`DELETE FROM offers WHERE id = $1 AND merchant_id = $2`, offerID, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+	}
+}
+
+// GET /v1/merchant/:id/categories
+func handleGetCategories(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		rows, err := db.Query(`SELECT name, description, emoji FROM categories WHERE merchant_id = $1 ORDER BY created_at ASC`, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		var cats []CategoryRow
+		for rows.Next() {
+			var cat CategoryRow
+			if err := rows.Scan(&cat.Name, &cat.Desc, &cat.Emoji); err == nil {
+				cats = append(cats, cat)
+			}
+		}
+		if cats == nil { cats = []CategoryRow{} }
+		c.JSON(http.StatusOK, cats)
+	}
+}
+
+// POST /v1/merchant/:id/categories
+func handleAddCategory(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		var cat CategoryRow
+		if err := c.ShouldBindJSON(&cat); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		_, err := db.Exec(`
+			INSERT INTO categories (merchant_id, name, description, emoji) 
+			VALUES ($1, $2, $3, $4) ON CONFLICT (merchant_id, name) DO NOTHING
+		`, merchantID, cat.Name, cat.Desc, cat.Emoji)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, cat)
+	}
+}
+
+// DELETE /v1/merchant/:id/categories/:name
+func handleDeleteCategory(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		merchantID := c.Param("id")
+		name := c.Param("name")
+		_, err := db.Exec(`DELETE FROM categories WHERE name = $1 AND merchant_id = $2`, name, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+	}
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -813,7 +991,7 @@ func main() {
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:3000", "https://*.vercel.app", "http://localhost:*"},
-		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: false,
@@ -862,6 +1040,16 @@ func main() {
 			merchant.GET("/velocity",  handleVelocity(db))
 			merchant.POST("/agent/recovery", handleRunRecoveryAgent(db))
 			merchant.POST("/agent/restock",  handleRunRestockAgent(db))
+
+			// New Category and Offer endpoints
+			merchant.GET("/offers", handleGetOffers(db))
+			merchant.POST("/offers", handleAddOffer(db))
+			merchant.PUT("/offers/:offer_id/toggle", handleToggleOffer(db))
+			merchant.DELETE("/offers/:offer_id", handleDeleteOffer(db))
+
+			merchant.GET("/categories", handleGetCategories(db))
+			merchant.POST("/categories", handleAddCategory(db))
+			merchant.DELETE("/categories/:name", handleDeleteCategory(db))
 		}
 
 		campaign := v1.Group("/campaign")

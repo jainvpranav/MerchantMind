@@ -50,33 +50,34 @@ tools = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "return_offer_to_terminal",
-        "description": (
-            "Finalises the chosen offer. Call this exactly once. "
-            "display_text must be under 80 characters — it shows on a small POS screen. "
-            "discount_amount must be the numeric savings value (e.g. 50 for 50 off)."
-        ),
+        "name": "return_offers_to_terminal",
+        "description": "Finalises the chosen offers. Call this exactly once.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "offer_category": {"type": "string"},
-                "display_text": {
-                    "type": "string",
-                    "description": "Offer shown on POS screen. Max 80 chars.",
-                },
-                "discount_amount": {
-                    "type": "number",
-                    "description": "The exact numeric savings provided by the offer in INR (e.g. 50, 200). If none, 0.",
-                },
-                "reasoning": {"type": "string"},
+                "offers": {
+                    "type": "array",
+                    "description": "A list of 1 to 3 distinct offer recommendations.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "offer_category": {"type": "string"},
+                            "display_text": {
+                                "type": "string",
+                                "description": "Offer shown on POS screen. Max 80 chars."
+                            },
+                            "discount_amount": {
+                                "type": "number",
+                                "description": "Numeric savings value (e.g. 50). If none, 0."
+                            },
+                            "reasoning": {"type": "string"}
+                        },
+                        "required": ["offer_category", "display_text", "discount_amount", "reasoning"]
+                    }
+                }
             },
-            "required": [
-                "offer_category",
-                "display_text",
-                "discount_amount",
-                "reasoning",
-            ],
-        },
+            "required": ["offers"]
+        }
     },
     {
         "name": "no_offer_available",
@@ -159,65 +160,41 @@ def get_customer_purchase_history(customer_hash: str) -> str:
 
 
 def get_available_offers() -> str:
-    # Hardcoded demo offers — replace with DB query when you build the offer management UI
-    return json.dumps(
-        [
-            {
-                "id": "offer-001",
-                "category": "Dairy",
-                "description": "Add ₹200+ of dairy — get ₹30 cashback",
-                "min_amount": 200,
-                "discount": 30,
-                "type": "cashback",
-            },
-            {
-                "id": "offer-002",
-                "category": "Pharma",
-                "description": "Buy any 2 pharma items — 10% off",
-                "min_amount": 150,
-                "discount": 10,
-                "type": "percentage",
-            },
-            {
-                "id": "offer-003",
-                "category": "Grocery",
-                "description": "Spend ₹500+ on groceries — free delivery",
-                "min_amount": 500,
-                "discount": 0,
-                "type": "free_delivery",
-            },
-            {
-                "id": "offer-004",
-                "category": "Personal Care",
-                "description": "First personal care purchase — ₹50 off",
-                "min_amount": 100,
-                "discount": 50,
-                "type": "flat_off",
-            },
-            {
-                "id": "offer-005",
-                "category": "Food & Bev",
-                "description": "Buy 3+ beverages — 1 free",
-                "min_amount": 120,
-                "discount": 0,
-                "type": "buy_x_get_1",
-            },
-        ]
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, offer_type, discount_value, min_amount, target_segment, category_tag
+        FROM offers
+        WHERE merchant_id = %s AND is_active = true
+        """,
+        (MERCHANT_ID,)
     )
+    rows = cur.fetchall()
+    conn.close()
+
+    offers = []
+    for r in rows:
+        offers.append({
+            "id": str(r[0]),
+            "description": r[1],
+            "type": r[2],
+            "discount": float(r[3]),
+            "min_amount": float(r[4]),
+            "segment": r[5],
+            "category": r[6]
+        })
+
+    return json.dumps(offers)
 
 
-def return_offer_to_terminal(
-    offer_category: str, display_text: str, discount_amount: float, reasoning: str
-) -> str:
+def return_offers_to_terminal(offers: list) -> str:
     global _offer_result
     _offer_result = {
         "has_offer": True,
-        "offer_category": offer_category,
-        "display_text": display_text,
-        "discount_amount": float(discount_amount),
-        "reasoning": reasoning,
+        "offers": offers,
     }
-    return json.dumps({"status": "offer_set", "display_text": display_text})
+    return json.dumps({"status": "offers_set", "count": len(offers)})
 
 
 def no_offer_available(reason: str) -> str:
@@ -231,13 +208,8 @@ def handle_tool(name: str, tool_input: dict) -> str:
         return get_customer_purchase_history(tool_input["customer_hash"])
     elif name == "get_available_offers":
         return get_available_offers()
-    elif name == "return_offer_to_terminal":
-        return return_offer_to_terminal(
-            tool_input["offer_category"],
-            tool_input["display_text"],
-            tool_input.get("discount_amount", 0.0),
-            tool_input.get("reasoning", ""),
-        )
+    elif name == "return_offers_to_terminal":
+        return return_offers_to_terminal(tool_input.get("offers", []))
     elif name == "no_offer_available":
         return no_offer_available(tool_input.get("reason", "No suitable offer"))
     return json.dumps({"error": f"Unknown tool: {name}"})
@@ -260,8 +232,8 @@ def run_dynamic_offer_agent(customer_hash: str) -> dict:
 You have under 2 seconds total. Be decisive:
 1. Call get_customer_purchase_history to see what they buy.
 2. Call get_available_offers to see active offers.
-3. Pick the SINGLE best offer for a category they have NEVER bought or rarely buy.
-4. Call return_offer_to_terminal (max 80 chars display_text).
+3. Pick 1 to 3 of the BEST distinct offers for categories they have NEVER bought or rarely buy.
+4. Call return_offers_to_terminal with the array of options.
    OR call no_offer_available if nothing fits.
 
 One offer only. Do not overthink it.""",

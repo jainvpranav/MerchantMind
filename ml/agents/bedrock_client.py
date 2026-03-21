@@ -25,8 +25,8 @@ load_dotenv(dotenv_path=_env_path)
 # US cross-region inference profiles — routes to best available region.
 # Change to "eu." prefix if your AWS account is EU-based.
 
-MODEL_SONNET = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"  # Agents 1 & 2
-MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # Agent 3 (fast)
+MODEL_SONNET = "amazon.nova-pro-v1:0"  # Alternatives for Agents 1 & 2
+MODEL_HAIKU = "amazon.nova-lite-v1:0"  # Fast Alternative for Agent 3
 
 # ── Client factory ────────────────────────────────────────────────────────────
 
